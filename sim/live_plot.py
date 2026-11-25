@@ -56,6 +56,7 @@ def _draw_states(ax_h, ax_n, samples, drawn: list) -> None:
     if not samples:
         return
     start, state = samples[0]["t"], samples[0]["state"]
+    k = 0  # labels of quick changes (Idle, Launch, Run) are staggered so they do not overlap
     for s in list(samples)[1:] + [None]:
         if s is None or s["state"] != state:
             end = samples[-1]["t"] if s is None else s["t"]
@@ -64,7 +65,8 @@ def _draw_states(ax_h, ax_n, samples, drawn: list) -> None:
                 for ax in (ax_h, ax_n):
                     drawn.append(ax.axvspan(start, end, color=colour, lw=0, zorder=0))
             if s is not None:
-                drawn.append(ax_h.text(s["t"], 930, f" {s['state']}", fontsize=8, va="top"))
+                drawn.append(ax_h.text(s["t"], 930 - 45 * (k % 3), f" {s['state']}", fontsize=8, va="top"))
+                k += 1
                 start, state = s["t"], s["state"]
 
 

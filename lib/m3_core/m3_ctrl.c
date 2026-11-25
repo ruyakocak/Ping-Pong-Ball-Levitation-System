@@ -98,10 +98,16 @@ bool m3_ctrl_on_height(m3_ctrl_t *c, uint32_t session, const ct_height_t *m, uin
              * rises to its target at the limited rate instead of shooting past it. */
             if (!c->have_ref) c->target_mm = g.h_mm;
             float max_step = c->have_ref ? rate * (float)(uint32_t)(now - c->ref_ms) * 1e-3f : 0.0f;
-            float d = t.target_mm - c->target_mm;
+            float goal = t.target_mm, ref = c->target_mm;
+            /* The ball is already past the ramp on its way to the target (it is still
+             * rising from the launch): the ramp catches up with the ball instead of
+             * pulling it back down to the ramp. */
+            if (goal > ref && g.h_mm > ref) ref = g.h_mm < goal ? g.h_mm : goal;
+            if (goal < ref && g.h_mm < ref) ref = g.h_mm > goal ? g.h_mm : goal;
+            float d = goal - ref;
             if (d > max_step) d = max_step;
             if (d < -max_step) d = -max_step;
-            t.target_mm = c->target_mm + d;
+            t.target_mm = ref + d;
             c->have_ref = true;
         } else {
             c->have_ref = false; /* Launch (and no ramp): the target is used as it is */

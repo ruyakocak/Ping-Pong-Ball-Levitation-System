@@ -27,7 +27,10 @@ raporu job özetine ve artifact'e koyar.
 HIL simülatörünü kartsız çalıştırmak (Windows / Linux):
 
 ```
+# Linux / Git Bash:
 gcc -O2 -std=gnu11 -Ilib/contract -Ilib/m3_core tools/vboard.c lib/contract/*.c lib/m3_core/*.c -lm -o vboard
+# Windows PowerShell:
+gcc -O2 -std=gnu11 -Ilib/contract -Ilib/m3_core tools/vboard.c (Get-ChildItem lib\contract\*.c, lib\m3_core\*.c).FullName -lm -o vboard
 python sim/hil_sim.py --virtual ./vboard --scenario hold
 python sim/hil_sim.py --virtual ./vboard --scenario step --plot
 ```
