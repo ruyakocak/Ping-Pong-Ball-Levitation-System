@@ -1,3 +1,4 @@
 platformio==6.2.0
 pyserial==3.5
 pytest==9.2.0
+matplotlib==3.10.0  # only for sim/live_plot.py (demo); the tests do not need it

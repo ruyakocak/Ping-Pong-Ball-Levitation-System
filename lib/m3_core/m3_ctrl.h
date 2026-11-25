@@ -34,6 +34,8 @@ typedef struct {
     float launch_rpm;   /* launch push starts here ... */
     float launch_ramp_rpm_s; /* ... and rises at this rate, capped at n_max, until the ball lifts
                                 (so a hover speed far from the model still lifts the ball) */
+    float target_rate_mm_s; /* fastest change of the target the PID sees (0 = no limit): a step
+                               command becomes a ramp, so the ball does not overshoot */
     float range_lo_mm;  /* usable height range (game levels map into it) */
     float range_hi_mm;
 } m3_ctrl_cfg_t;
@@ -47,6 +49,8 @@ typedef struct {
     bool game_mode;         /* set only through the mode command */
     uint8_t mode;           /* m3_mode_t (hold / wave / game), for status */
     float target_mm;        /* target used at the last control step, for status */
+    bool have_ref;          /* rate-limited target valid */
+    uint32_t ref_ms;
     m3_stuck_t stuck;       /* stuck-ball warning: status only, never a fault */
 
     /* game board link (Serial1) */

@@ -5,9 +5,12 @@
 void m3_ctrl_default_cfg(m3_ctrl_cfg_t *cfg)
 {
     /* Starting values for the textbook plant (m3_plant.h); tuned in simulation. */
-    cfg->pid.kp = 1.4f;  /* tools/tune_gains.c, worst case over +-30 % models, noise 5 mm, 5 % drops */
+    /* tools/tune_gains.c: R3.9 worst case over +-30 % models (noise 5 mm, 5 % drops) and the
+     * T3.8 step. A middle choice (team decision 25.11): kd 0.7 gave the best result on
+     * M2's filtered height, but swings up to 120 mm on raw heights only; kd 0.5 halves that. */
+    cfg->pid.kp = 1.8f;
     cfg->pid.ki = 0.8f;
-    cfg->pid.kd = 0.13f;
+    cfg->pid.kd = 0.5f;
     cfg->pid.i_max = 2500.0f; /* >= n_max - hover, so a stuck ball can drive the output to the limit */
     cfg->pid.n_min = 0.0f;
     cfg->pid.n_max = 5800.0f; /* below abs max 6000; covers a hover speed up to +70 % of the model */
@@ -15,6 +18,7 @@ void m3_ctrl_default_cfg(m3_ctrl_cfg_t *cfg)
     cfg->hover_rpm = 3000.0f;
     cfg->launch_rpm = 3000.0f * 1.15f;
     cfg->launch_ramp_rpm_s = 2000.0f;
+    cfg->target_rate_mm_s = 250.0f; /* a step command becomes a ramp; M4 waves (<= 190 mm/s) pass */
     cfg->range_lo_mm = 100.0f; /* provisional, until the rig is measured */
     cfg->range_hi_mm = 850.0f;
 }
@@ -88,7 +92,22 @@ bool m3_ctrl_on_height(m3_ctrl_t *c, uint32_t session, const ct_height_t *m, uin
     m3_fsm_out_t o = m3_fsm_output(&c->fsm);
     if (g.src != HG_SRC_NONE && o.enable) {
         m3_target_t t = m3_tbuf_get(&c->tbuf, now);
+        float rate = c->cfg.target_rate_mm_s;
+        if (rate > 0.0f && c->fsm.state == ST_RUN) {
+            /* First Run step after the launch: the ramp starts at the ball, so the ball
+             * rises to its target at the limited rate instead of shooting past it. */
+            if (!c->have_ref) c->target_mm = g.h_mm;
+            float max_step = c->have_ref ? rate * (float)(uint32_t)(now - c->ref_ms) * 1e-3f : 0.0f;
+            float d = t.target_mm - c->target_mm;
+            if (d > max_step) d = max_step;
+            if (d < -max_step) d = -max_step;
+            t.target_mm = c->target_mm + d;
+            c->have_ref = true;
+        } else {
+            c->have_ref = false; /* Launch (and no ramp): the target is used as it is */
+        }
         c->target_mm = t.target_mm;
+        c->ref_ms = now;
         if (g.src_switched) m3_pid_restart_derivative(&c->pid);
         float n_pid = m3_pid_step(&c->pid, t.target_mm, g.h_mm, g.dt_s, c->cfg.hover_rpm, t.ff_rpm);
         if (o.launch_push) {
@@ -104,6 +123,7 @@ bool m3_ctrl_on_height(m3_ctrl_t *c, uint32_t session, const ct_height_t *m, uin
                         c->pid.cfg.n_max, now);
     } else if (!o.enable) {
         m3_stuck_init(&c->stuck);
+        c->have_ref = false;
     }
     build_cmd(c, now, cmd, seq);
     return true;

@@ -64,6 +64,23 @@ class SimM1:
         self.last_seq = 0
         self.fault_code = 0
         self.cmds = 0
+        self.fault_latched = False  # a blower fault: re-arm refused until the cause is cleared
+        self.estop_pressed = False
+
+    def inject_fault(self, code: int = 1) -> None:
+        self.fault_latched, self.fault_code = True, code
+        self.state, self.enabled, self.rpm_cmd = ct.M1_FAULT, False, 0.0
+
+    def press_estop(self) -> None:
+        self.estop_pressed = True
+        self.state, self.enabled, self.rpm_cmd = ct.M1_ESTOP, False, 0.0
+
+    def clear(self) -> None:
+        """Cause gone (fault repaired, E-stop released): still off until M3 re-arms."""
+        self.fault_latched = self.estop_pressed = False
+        self.fault_code = 0
+        if self.state == ct.M1_ESTOP:
+            self.state = ct.M1_OFF
 
     def on_fan_cmd(self, frame: ct.Frame, now: float) -> None:
         if self.seq.accept(frame.session, frame.seq) == "old":
@@ -71,6 +88,9 @@ class SimM1:
         rpm, _top, flags = ct.unpack(ct.FAN_CMD, frame.payload)
         self.cmds += 1
         self.last_cmd_t, self.last_seq = now, frame.seq
+        if self.estop_pressed or self.fault_latched:
+            self.enabled, self.rpm_cmd = False, 0.0
+            return
         if flags & ct.FCMD_REARM and self.state in (ct.M1_OFF, ct.M1_FAULT):
             self.state = ct.M1_ARMED
         self.enabled = bool(flags & ct.FCMD_ENABLE) and self.state in (ct.M1_ARMED, ct.M1_RUN)
@@ -82,6 +102,36 @@ class SimM1:
             if self.state in (ct.M1_ARMED, ct.M1_RUN):
                 self.state = ct.M1_OFF  # lost link: latched off until re-armed
             self.enabled, self.rpm_cmd = False, 0.0
+
+
+class M2Filter:
+    """M2 stand-in filter: same alpha-beta filter and numbers as tools/m2_standin.h.
+
+    M2 sends the raw height AND a filtered one (its Kalman filter, moved forward by
+    the camera delay). This one is deliberately weaker than M2's own pass conditions
+    (R2.4, R2.5; checked in sim/tests/test_m2_standin.py), so M3 is never tested
+    against a better M2 than the contract promises.
+    """
+
+    ALPHA, BETA, FRAME_S = 0.35, 0.06, 1 / 60
+
+    def __init__(self) -> None:
+        self.x = self.v = 0.0
+        self.frame: int | None = None
+
+    def update(self, z: float, frame: int, delay_s: float) -> float:
+        if self.frame is None:
+            self.x, self.v = z, 0.0
+        else:
+            dt = (frame - self.frame) * self.FRAME_S
+            if dt <= 0 or dt > 0.2:
+                dt = self.FRAME_S
+            xp = self.x + self.v * dt
+            r = z - xp
+            self.x = xp + self.ALPHA * r
+            self.v += self.BETA * r / dt
+        self.frame = frame
+        return self.x + self.v * delay_s
 
 
 class Rig:
@@ -97,7 +147,10 @@ class Rig:
         self.frame_no = self.fs_seq = 0
         self.next_frame = self.next_fs = 0.0
         self.history: deque[tuple[float, float]] = deque()
-        self.camera_on = True
+        self.camera = "ok"        # "ok", "off" (M2 silent) or "bridged" (only predicted heights)
+        self.fan_state_on = True   # False: the fan_state link is cut
+        self.last_meas: float | None = None
+        self.m2f = M2Filter()
 
     def step(self, now: float, dt: float, from_board_m1: bytes) -> tuple[bytes, bytes]:
         """Advances the rig to `now`. Returns (bytes for the board's USB, bytes for its Serial2)."""
@@ -116,16 +169,20 @@ class Rig:
                 seen = self.history.popleft()
             if seen is not None:
                 self.history.appendleft(seen)  # keep the newest delayed sample
-            if self.camera_on and seen is not None and self.rng.random() >= self.drop:
+            if self.camera != "off" and seen is not None and self.rng.random() >= self.drop:
                 h = seen[1] + self.rng.gauss(0, self.noise_mm)
+                hf = self.m2f.update(h, self.frame_no, self.delay_s)
                 flags = ct.HFLAG_RAW_VALID | ct.HFLAG_FILT_VALID
-                payload = ct.pack(ct.HEIGHT, round(h), round(h), int(self.plant.v_mm_s), flags,
+                if self.camera == "bridged":  # filter predicts, no real measurement behind it
+                    flags = ct.HFLAG_FILT_VALID | ct.HFLAG_BRIDGED
+                self.last_meas = hf
+                payload = ct.pack(ct.HEIGHT, round(h), round(hf), round(self.m2f.v), flags,
                                   self.frame_no, int(seen[0] * 1e6), 600)
                 usb = ct.encode_frame(ct.HEIGHT, self.m2_session, self.frame_no, payload)
             self.frame_no += 1
 
         m1 = b""
-        if now >= self.next_fs:  # M1: fan_state 100 Hz
+        if now >= self.next_fs and self.fan_state_on:  # M1: fan_state 100 Hz
             self.next_fs += 0.010
             payload = ct.pack(ct.FAN_STATE, int(self.plant.rpm), 0, 0, self.m1.state, self.m1.fault_code,
                               self.m1.last_seq)
@@ -214,6 +271,7 @@ class Operator:
         self.n_status = 0
         self.bad_json = 0
         self.started_at: float | None = None
+        self.starts: list[float] = []      # every accepted Start (the first, then after each recovery)
         self._next_try = 0.05
         self._reset_ok = False
         self._extra: list[tuple[float, dict]] = []
@@ -260,6 +318,11 @@ class Operator:
                     self._reset_ok = True
                 if cmd == "start" and m.get("ok") and self.started_at is None:
                     self.started_at = now
+                    self.starts.append(now)
+
+    def restart(self, now: float) -> None:
+        """Recover after a fault the normal way: Reset (retried while refused), then Start."""
+        self.started_at, self._reset_ok, self._next_try = None, False, now
 
 
 class TargetSender:
@@ -312,73 +375,127 @@ class Result:
     m1_state: int = 0
     fan_cmds: int = 0
     crc_errors: int = 0
-    off_after_loss_ms: float | None = None
     started_at_s: float | None = None
     acks: list[dict] = field(default_factory=list)
     status_msgs: int = 0
     bad_json: int = 0
     last_status: dict | None = None
+    # targets (T3.7)
     targets_sent: int = 0
-    target_err_mean_mm: float | None = None  # targets: board's target vs sent trajectory (T3.7)
+    target_err_mean_mm: float | None = None  # board's target vs sent trajectory
     target_err_max_mm: float | None = None
+    # step (T3.8)
+    overshoot_mm: float | None = None
+    settle_s: float | None = None
+    # failures (T3.5, T3.6, T3.11) and the reset sequence (T3.2)
+    off_after_loss_ms: float | None = None   # fault injected -> blower commanded off
+    fault_after_ms: float | None = None      # fault injected -> board in Fault
+    fault_cause: str | None = None           # from status
+    in_fault_until_reset: bool | None = None # still Fault when the operator sent Reset
+    restarted_at_s: float | None = None      # Start accepted again after the recovery
     log: str = ""
     notes: list[str] = field(default_factory=list)
 
 
-def run(args: argparse.Namespace) -> Result:
+FAULT_SCENARIOS = ("camera_loss", "bridged_only", "m1_fault", "estop", "fan_state_lost")
+SCENARIOS = ("hold", "step", "targets", "commands") + FAULT_SCENARIOS
+SETTLED_BAND_MM = 20.0
+
+
+def run(args: argparse.Namespace, on_sample=None) -> Result:
+    """Runs one scenario. on_sample(dict) is called every 10 ms (live plot)."""
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
     params = PlantParams.load(cfg.get("plant_params")).scaled(args.model_scale)
     rig = Rig(params, args.noise_mm, args.drop, cfg.get("camera_delay_s", 0.030), args.seed)
     mode = "virtual" if args.virtual else "serial"
-    res = Result(args.scenario, mode, platform.system(), args.duration, args.target)
+    sc = args.scenario
+    hold_mm = args.step_from if sc == "step" else args.target
+    res = Result(sc, mode, platform.system(), args.duration, args.step_to if sc == "step" else args.target)
     op = Operator(rig.rng)
     m4 = None
-    if args.scenario == "targets":
+    if sc == "targets":
         m4 = TargetSender(rig.rng, args.settle - 5.0, args.target, args.amp, args.freq, args.max_delay)
-    if args.scenario == "commands":
+    if sc == "commands":
         op.schedule(args.settle, "set", param="kp", value=1.2)
         op.schedule(args.settle + 0.5, "set", param="abs_max_rpm", value=7000)   # safety limit: refused
         op.schedule(args.settle + 1.0, "set", param="kp", value=999)             # out of range: refused
         op.schedule(args.settle + 1.5, "mode", mode="game")                      # flying: refused
+    step_at = args.settle if sc == "step" else None
+    if step_at is not None:
+        op.schedule(step_at, "set", param="target_mm", value=args.step_to)
+    fault_at = args.fault_at if sc in FAULT_SCENARIOS else None
+    clear_at = fault_at + 1.0 if fault_at is not None else None
+    restart_at = fault_at + 2.0 if fault_at is not None else None
 
     out_dir = HERE.parent / "reports"
     out_dir.mkdir(exist_ok=True)
-    log_path = out_dir / time.strftime(f"hil_{args.scenario}_{mode}_%Y-%m-%d_%H-%M-%S.csv")
+    log_path = out_dir / time.strftime(f"hil_{sc}_{mode}_%Y-%m-%d_%H-%M-%S.csv")
     res.log = str(log_path)
 
     board = udp = h_port = m1_port = None
     if args.virtual:
-        board = VirtualBoard(Path(args.virtual), args.target)
+        board = VirtualBoard(Path(args.virtual), hold_mm)
     else:
         import serial  # pyserial, only needed with a real board
 
         h_port = serial.Serial(cfg["height_port"], 115200, timeout=0)
         m1_port = serial.Serial(cfg["m1_port"], 115200, timeout=0)
         udp = UdpLink(cfg["board_ip"], cfg.get("board_udp_port", 5005), cfg.get("hil_udp_port", 5010))
+        if sc == "step":
+            op.schedule(0.02, "set", param="target_mm", value=hold_mm)
+
+    def board_state() -> str:
+        if board:
+            return STATE_NAMES.get(board.state, str(board.state))
+        return op.status.get("state", "").capitalize() if op.status else ""
 
     errs: list[float] = []
     lo, hi = float("inf"), float("-inf")
-    loss_at = args.loss_at if args.scenario == "camera_loss" else None
-    off_at = None
+    peak = float("-inf")
+    last_out_of_band = None
+    off_at = fault_seen_at = None
     from_board = b""
     t0 = time.perf_counter()
     now = last = 0.0
     step_ms = 0
     with log_path.open("w", newline="", encoding="utf-8") as fh:
         log = csv.writer(fh)
-        log.writerow(["t_s", "true_h_mm", "target_mm", "rpm", "rpm_cmd", "m1_state", "board_state"])
+        log.writerow(["t_s", "true_h_mm", "meas_mm", "board_target_mm", "ref_mm", "rpm", "rpm_cmd",
+                      "m1_state", "board_state"])
         while now < args.duration:
             if board:
                 step_ms += 1
                 now = step_ms / 1000.0
+                if args.realtime:
+                    lag = now - (time.perf_counter() - t0)
+                    if lag > 0.002:
+                        time.sleep(lag)
             else:
                 now = time.perf_counter() - t0
             dt, last = now - last, now
-            if loss_at is not None and now >= loss_at:
-                rig.camera_on = False
+
+            if fault_at is not None and now >= fault_at and (clear_at is None or now < clear_at):
+                if sc == "camera_loss":
+                    rig.camera = "off"
+                elif sc == "bridged_only":
+                    rig.camera = "bridged"
+                elif sc == "fan_state_lost":
+                    rig.fan_state_on = False
+                elif sc == "m1_fault" and rig.m1.state != ct.M1_FAULT:
+                    rig.m1.inject_fault(code=7)
+                elif sc == "estop" and not rig.m1.estop_pressed:
+                    rig.m1.press_estop()
+            if clear_at is not None and now >= clear_at and (rig.camera != "ok" or not rig.fan_state_on
+                                                             or rig.m1.fault_latched or rig.m1.estop_pressed):
+                rig.camera, rig.fan_state_on = "ok", True
+                rig.next_fs = now
+                rig.m1.clear()
+            if restart_at is not None and now >= restart_at and res.in_fault_until_reset is None:
+                res.in_fault_until_reset = board_state() == "Fault"
+                op.restart(now)
+
             usb, m1 = rig.step(now, dt, from_board)
             datagrams = op.step(now) + (m4.step(now) if m4 else [])
-
             if board:
                 from_board, replies = board.exchange(step_ms, usb, m1, datagrams)
             else:
@@ -391,29 +508,60 @@ def run(args: argparse.Namespace) -> Result:
                 time.sleep(0.0005)
             op.receive(now, replies)
 
-            target = m4.target(now) if m4 else args.target
-            if loss_at is not None and off_at is None and now >= loss_at and rig.m1.rpm_cmd == 0.0:
-                off_at = now
-            if loss_at is None and now >= args.settle:
-                errs.append(abs(rig.plant.h_mm - target))
-                lo, hi = min(lo, rig.plant.h_mm), max(hi, rig.plant.h_mm)
-            if step_ms % 10 == 0 or not board:
-                st = op.status["state"] if op.status else ""
-                log.writerow([f"{now:.3f}", f"{rig.plant.h_mm:.1f}", f"{target:.1f}", f"{rig.plant.rpm:.0f}",
-                              f"{rig.m1.rpm_cmd:.0f}", rig.m1.state, st])
+            if step_at is not None:
+                ref = args.step_to if now >= step_at else hold_mm
+            else:
+                ref = m4.target(now) if m4 else args.target
+            h = rig.plant.h_mm
 
+            if fault_at is not None and now >= fault_at:
+                if off_at is None and rig.m1.rpm_cmd == 0.0:
+                    off_at = now
+                if fault_seen_at is None and board_state() == "Fault":
+                    fault_seen_at = now
+                if res.fault_cause is None and op.status and op.status.get("state") == "fault" and \
+                        op.status_log and op.status_log[-1][0] >= fault_at:
+                    res.fault_cause = op.status.get("fault")
+            elif step_at is not None and now >= step_at:
+                peak = max(peak, h)
+                if abs(h - ref) > SETTLED_BAND_MM:
+                    last_out_of_band = now
+                if now >= step_at + 4.0:
+                    errs.append(abs(h - ref))
+                    lo, hi = min(lo, h), max(hi, h)
+            elif step_at is None and fault_at is None and now >= args.settle:
+                errs.append(abs(h - ref))
+                lo, hi = min(lo, h), max(hi, h)
+
+            if step_ms % 10 == 0 or not board:
+                bt = op.status.get("target_mm") if op.status else None
+                sample = {"t": now, "h": h, "meas": rig.last_meas, "board_target": bt, "ref": ref,
+                          "rpm": rig.plant.rpm, "rpm_cmd": rig.m1.rpm_cmd, "m1_state": rig.m1.state,
+                          "state": board_state()}
+                log.writerow([f"{now:.3f}", f"{h:.1f}", "" if rig.last_meas is None else f"{rig.last_meas:.1f}",
+                              "" if bt is None else bt, f"{ref:.1f}", f"{rig.plant.rpm:.0f}",
+                              f"{rig.m1.rpm_cmd:.0f}", rig.m1.state, sample["state"]])
+                if on_sample:
+                    on_sample(sample)
+
+    res.final_state = board_state()
     if board:
-        res.final_state = STATE_NAMES.get(board.state, str(board.state))
         board.close()
-    elif op.status:
-        res.final_state = op.status.get("state", "").capitalize()
     if errs:
         res.mean_err_mm = round(sum(errs) / len(errs), 2)
         res.p2p_mm = round(hi - lo, 2)
-    if loss_at is not None and off_at is not None:
-        res.off_after_loss_ms = round((off_at - loss_at) * 1000.0, 1)
+    if step_at is not None and peak > float("-inf"):
+        res.overshoot_mm = round(max(0.0, peak - args.step_to), 1)
+        res.settle_s = round((last_out_of_band or step_at) - step_at, 2)
+    if fault_at is not None:
+        if off_at is not None:
+            res.off_after_loss_ms = round((off_at - fault_at) * 1000.0, 1)
+        if fault_seen_at is not None:
+            res.fault_after_ms = round((fault_seen_at - fault_at) * 1000.0, 1)
+        if len(op.starts) >= 2:
+            res.restarted_at_s = round(op.starts[1], 3)
     res.m1_state, res.fan_cmds, res.crc_errors = rig.m1.state, rig.m1.cmds, rig.dec.crc_errors
-    res.started_at_s = op.started_at
+    res.started_at_s = op.started_at if not op.starts else op.starts[0]
     res.acks = [{k: a.get(k) for k in ("request_id", "cmd", "param", "ok", "pending", "applied", "reason", "rx_s")
                  if k in a} for a in op.acks]
     res.status_msgs, res.bad_json, res.last_status = op.n_status, op.bad_json, op.status
@@ -435,12 +583,15 @@ def run(args: argparse.Namespace) -> Result:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", type=Path, default=HERE / "hil_config.json")
-    ap.add_argument("--scenario", choices=["hold", "camera_loss", "targets", "commands"], default="hold")
+    ap.add_argument("--scenario", choices=SCENARIOS, default="hold")
     ap.add_argument("--virtual", type=Path, help="path to the vboard program; omit for a real board")
     ap.add_argument("--duration", type=float, default=30.0)
-    ap.add_argument("--settle", type=float, default=15.0, help="seconds before measuring")
-    ap.add_argument("--loss-at", type=float, default=10.0, help="camera_loss: when M2 goes silent")
+    ap.add_argument("--settle", type=float, default=15.0, help="seconds before measuring / before the step")
+    ap.add_argument("--fault-at", "--loss-at", dest="fault_at", type=float, default=10.0,
+                    help="failure scenarios: when the failure starts (cleared 1 s later, Reset/Start 1 s after)")
     ap.add_argument("--target", type=float, default=500.0, help="hold target / wave centre, mm")
+    ap.add_argument("--step-from", type=float, default=300.0, help="step: first height, mm")
+    ap.add_argument("--step-to", type=float, default=500.0, help="step: second height, mm")
     ap.add_argument("--amp", type=float, default=100.0, help="targets: wave amplitude, mm")
     ap.add_argument("--freq", type=float, default=0.2, help="targets: wave frequency, Hz")
     ap.add_argument("--max-delay", type=float, default=0.150, help="targets: random network delay up to, s")
@@ -448,11 +599,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--drop", type=float, default=0.0, help="fraction of dropped frames")
     ap.add_argument("--model-scale", type=float, default=1.0, help="R3.9 robustness factor")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--realtime", action="store_true", help="virtual board: run at wall-clock speed")
+    ap.add_argument("--plot", action="store_true", help="live plot (implies --realtime); needs matplotlib")
     return ap.parse_args(argv)
 
 
 def main() -> None:
-    res = run(parse_args())
+    args = parse_args()
+    if args.plot:
+        from live_plot import run_with_plot  # matplotlib only when asked for
+
+        args.realtime = True
+        res = run_with_plot(run, args)
+    else:
+        res = run(args)
     print(json.dumps(res.__dict__, indent=2))
 
 

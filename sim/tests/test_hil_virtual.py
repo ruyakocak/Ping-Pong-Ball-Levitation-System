@@ -55,12 +55,6 @@ def test_R3_13_hil_sim_holds_ball_with_virtual_board(vboard):
     assert r.p2p_mm <= 50.0, r
 
 
-def test_R3_13_hil_sim_camera_loss_switches_off_with_virtual_board(vboard):
-    r = _run(vboard, "--scenario", "camera_loss", "--duration", "12", "--loss-at", "10", "--seed", "8")
-    assert r.final_state == "Fault"
-    assert r.off_after_loss_ms is not None and r.off_after_loss_ms <= 200.0, r  # R3.5
-
-
 def test_R3_13_hil_sim_starts_board_with_json_commands_and_reads_status(vboard):
     r = _run(vboard, "--scenario", "hold", "--duration", "6", "--settle", "4", "--seed", "9",
              name="start_and_status")
@@ -96,3 +90,39 @@ def test_R3_10_hil_live_commands_checked_while_flying(vboard):
     mode = by[("mode", None)]
     assert not mode["ok"] and mode["reason"] == "wrong_state"
     assert r.final_state == "Run"  # refused commands changed nothing; still flying
+
+
+# Failures (T3.5, T3.6, T3.11) and the reset sequence (T3.2): the failure starts at 10 s,
+# its cause is cleared at 11 s, the operator sends Reset/Start at 12 s.
+FAILURES = [
+    # scenario,        board in Fault within, cause in status
+    ("camera_loss",    200.0, "no_height"),       # R3.5: no new real height for 200 ms
+    ("bridged_only",   200.0, "no_height"),       # R3.6: bridged heights never reset the timer
+    ("m1_fault",        20.0, "m1_fault"),        # R3.11
+    ("estop",           20.0, "estop"),           # R3.11
+    ("fan_state_lost", 110.0, "fan_state_lost"),  # R3.11: fan_state lost 100 ms
+]
+
+
+@pytest.mark.parametrize("scenario,limit_ms,cause", FAILURES)
+def test_R3_11_hil_failure_puts_board_in_fault_and_reset_recovers(vboard, scenario, limit_ms, cause):
+    r = _run(vboard, "--scenario", scenario, "--duration", "16", "--fault-at", "10", "--seed", "12",
+             name=scenario)
+    assert r.fault_after_ms is not None and r.fault_after_ms <= limit_ms, r
+    assert r.off_after_loss_ms is not None and r.off_after_loss_ms <= limit_ms, r  # blower commanded off
+    assert r.fault_cause == cause, r
+    assert r.in_fault_until_reset is True  # Fault is never left without Reset (T3.2)
+    assert r.restarted_at_s is not None and 12.0 <= r.restarted_at_s < 13.5, r.acks
+    assert r.final_state == "Run"  # Reset, re-arm and Start brought it back
+
+
+def test_R3_8_hil_step_30_to_50_cm(vboard):
+    # T3.8: the step as M5 would send it (target_mm command), 1 mm noise.
+    r = _run(vboard, "--scenario", "step", "--duration", "30", "--settle", "15", "--seed", "13")
+    step = [a for a in r.acks if a.get("param") == "target_mm"]
+    assert step and step[0]["ok"] and step[0]["applied"] == 500.0
+    assert r.final_state == "Run"
+    assert r.overshoot_mm < 50.0, r      # overshoot below 5 cm
+    assert r.settle_s <= 4.0, r          # settled within 4 s
+    assert r.mean_err_mm <= 20.0, r      # then mean error <= 2 cm
+    assert r.p2p_mm <= 30.0, r           # oscillation within 3 cm

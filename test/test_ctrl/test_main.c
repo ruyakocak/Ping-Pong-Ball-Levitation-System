@@ -8,6 +8,7 @@
 #include <unity.h>
 
 #include "m3_ctrl.h"
+#include "../../tools/m2_standin.h"
 #include "m3_plant.h"
 
 void setUp(void) {}
@@ -39,6 +40,9 @@ typedef struct {
     int drop_pct;        /* frames lost, percent */
     uint32_t rng;
     int dropped;
+    /* M2 stand-in: filtered height from an alpha-beta filter (tools/m2_standin.h) */
+    m2si_t m2f;
+    bool filt_off;       /* filtered height invalid (R3.6 raw fallback) */
 } sim_t;
 
 static sim_t S;
@@ -84,6 +88,8 @@ static void sim_init_model(float target, const m3_plant_params_t *truth)
     S.drop_pct = 0;
     S.rng = 2463534242u;
     S.dropped = 0;
+    m2si_init(&S.m2f);
+    S.filt_off = false;
     for (int i = 0; i < 64; i++) S.delayed_h[i] = 0.0f;
 }
 
@@ -117,9 +123,10 @@ static void sim_step(void)
         float h = S.delayed_h[(S.t_ms - 30) % 64] + S.noise_mm * gauss();
         ++S.frame;
         if (S.drop_pct && urand() * 100.0f < (float)S.drop_pct) { S.dropped++; goto tick; } /* frame lost */
+        float hf = m2si_update(&S.m2f, h, S.frame, 0.030f);
         uint8_t flags = S.bridged_only ? (CT_HFLAG_FILT_VALID | CT_HFLAG_BRIDGED)
-                                       : (CT_HFLAG_RAW_VALID | CT_HFLAG_FILT_VALID);
-        ct_height_t m = {(int16_t)lrintf(h), (int16_t)lrintf(h), 0, flags, S.frame,
+                                       : (CT_HFLAG_RAW_VALID | (S.filt_off ? 0 : CT_HFLAG_FILT_VALID));
+        ct_height_t m = {(int16_t)lrintf(h), (int16_t)lrintf(hf), 0, flags, S.frame,
                          (uint64_t)(S.t_ms - 30) * 1000u, 600};
         if (m3_ctrl_on_height(&S.ctl, 2, &m, S.t_ms, &cmd, &seq)) on_cmd(&cmd, seq);
     }
@@ -205,6 +212,95 @@ void test_R3_8_holds_simulated_ball(void)
     TEST_ASSERT_EQUAL(ST_RUN, S.ctl.fsm.state);
     TEST_ASSERT_TRUE_MESSAGE(sum / n <= 20.0, msg);   /* mean error <= 2 cm */
     TEST_ASSERT_TRUE_MESSAGE(hi - lo <= 30.0, msg);   /* oscillation within 3 cm */
+}
+
+/* T3.8: three heights, then a 30 -> 50 cm step (1 mm noise, as the HIL default). */
+void test_R3_8_three_heights_and_step(void)
+{
+    const float H[3] = {300.0f, 500.0f, 750.0f};
+    char msg[160];
+    for (int k = 0; k < 3; k++) {
+        sim_init(H[k]);
+        S.noise_mm = 1.0f;
+        reset_and_start();
+        run_ms(8000);
+        double sum = 0, lo = 1e9, hi = -1e9;
+        int n = 0;
+        for (int i = 0; i < 20000; i++, n++) {
+            sim_step();
+            sum += fabs(S.plant.h_mm - H[k]);
+            if (S.plant.h_mm < lo) lo = S.plant.h_mm;
+            if (S.plant.h_mm > hi) hi = S.plant.h_mm;
+        }
+        snprintf(msg, sizeof msg, "hold %.0f mm: mean %.1f mm, p2p %.1f mm", H[k], sum / n, hi - lo);
+        TEST_MESSAGE(msg);
+        TEST_ASSERT_EQUAL(ST_RUN, S.ctl.fsm.state);
+        TEST_ASSERT_TRUE_MESSAGE(sum / n <= 20.0, msg);
+        TEST_ASSERT_TRUE_MESSAGE(hi - lo <= 30.0, msg);
+    }
+
+    sim_init(300);
+    S.noise_mm = 1.0f;
+    reset_and_start();
+    run_ms(10000);
+    m3_ctrl_set_hold_target(&S.ctl, 500); /* the step, as the target_mm command applies it */
+    double peak = -1e9, sum = 0, lo = 1e9, hi = -1e9;
+    uint32_t last_out = 0;
+    int n = 0;
+    for (uint32_t i = 1; i <= 20000; i++) {
+        sim_step();
+        double h = S.plant.h_mm;
+        if (h > peak) peak = h;
+        if (fabs(h - 500.0) > 20.0) last_out = i;
+        if (i > 4000) {
+            sum += fabs(h - 500.0);
+            if (h < lo) lo = h;
+            if (h > hi) hi = h;
+            n++;
+        }
+    }
+    snprintf(msg, sizeof msg, "step 300->500: overshoot %.1f mm, settled (+-2 cm) after %.2f s, then mean %.1f p2p %.1f",
+             peak - 500.0, last_out / 1000.0, sum / n, hi - lo);
+    TEST_MESSAGE(msg);
+    TEST_ASSERT_TRUE_MESSAGE(peak - 500.0 < 50.0, msg);   /* overshoot below 5 cm */
+    TEST_ASSERT_TRUE_MESSAGE(last_out <= 4000, msg);      /* settled within 4 s */
+    TEST_ASSERT_TRUE_MESSAGE(sum / n <= 20.0, msg);
+    TEST_ASSERT_TRUE_MESSAGE(hi - lo <= 30.0, msg);
+}
+
+/* T3.6 (first part): filtered height invalid for 10 s during a hold -> control goes on
+ * on the raw height; the command never changes faster than the rate limit. 5 mm noise. */
+void test_R3_6_filtered_height_lost_during_hold_control_continues(void)
+{
+    sim_init(500);
+    S.noise_mm = 5.0f;
+    reset_and_start();
+    run_ms(10000);
+    float rate = S.ctl.pid.cfg.rate_rpm_s;
+    uint16_t prev = S.last_cmd.bottom_rpm;
+    uint32_t prev_ms = S.t_ms;
+    double lo = 1e9, hi = -1e9;
+    for (int i = 0; i < 14000; i++) {
+        S.filt_off = i >= 2000 && i < 12000;
+        int before = S.cmds_sent;
+        sim_step();
+        /* repeats on the 10 ms tick carry the same value, so measure from the last change */
+        if (S.cmds_sent != before && S.last_cmd.bottom_rpm != prev) {
+            float limit = rate * (S.t_ms - prev_ms) * 1e-3f + 1.0f; /* +1: rpm rounding */
+            TEST_ASSERT_TRUE(fabsf((float)S.last_cmd.bottom_rpm - (float)prev) <= limit);
+            prev = S.last_cmd.bottom_rpm;
+            prev_ms = S.t_ms;
+        }
+        TEST_ASSERT_EQUAL(ST_RUN, S.ctl.fsm.state);
+        if (S.filt_off) {
+            if (S.plant.h_mm < lo) lo = S.plant.h_mm;
+            if (S.plant.h_mm > hi) hi = S.plant.h_mm;
+        }
+    }
+    char msg[96];
+    snprintf(msg, sizeof msg, "raw only for 10 s, 5 mm noise: p2p %.1f mm (quality, not a pass condition)", hi - lo);
+    TEST_MESSAGE(msg);
+    TEST_ASSERT_TRUE(lo > 300.0 && hi < 700.0); /* the ball stays well clear of grille and top */
 }
 
 /* ---------- R3.11 (a): each fault 10 times -> fault within 100 ms ---------- */
@@ -378,6 +474,8 @@ int main(void)
     RUN_TEST(test_R3_5_heights_stop_fault_within_200ms);
     RUN_TEST(test_R3_5b_only_bridged_heights_fault_within_200ms);
     RUN_TEST(test_R3_8_holds_simulated_ball);
+    RUN_TEST(test_R3_8_three_heights_and_step);
+    RUN_TEST(test_R3_6_filtered_height_lost_during_hold_control_continues);
     RUN_TEST(test_R3_9_gains_robust_to_30pct_model_error_noise_and_drops);
     RUN_TEST(test_R3_9_dropped_frames_really_dropped);
     RUN_TEST(test_R3_11_m1_fault_10_times_fault_within_100ms);

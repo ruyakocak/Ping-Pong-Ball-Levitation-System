@@ -105,16 +105,19 @@ def main() -> int:
     hil = REPORTS / f"hil_virtual_{osname}.json"
     if hil.exists():
         lines += ["", "## HIL simulator, virtual board", "",
-                  "| Scenario | Board state | Mean error mm | Peak-to-peak mm | Target vs sent max mm "
-                  "| Off after camera loss ms | Acks | Status msgs | Bad JSON | CRC errors |",
-                  "|---|---|---|---|---|---|---|---|---|---|"]
+                  "| Scenario | Board state | Mean error mm | Peak-to-peak mm | Overshoot mm | Settled s "
+                  "| Target vs sent max mm | Fault after ms | Cause | Fault until Reset | Acks | Status msgs "
+                  "| Bad JSON | CRC errors |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
 
         def cell(v):
             return "-" if v is None else v
 
         for name, r in json.loads(hil.read_text(encoding="utf-8")).items():
             lines.append(f"| {name} | {r['final_state']} | {cell(r['mean_err_mm'])} | {cell(r['p2p_mm'])} | "
-                         f"{cell(r.get('target_err_max_mm'))} | {cell(r['off_after_loss_ms'])} | "
+                         f"{cell(r.get('overshoot_mm'))} | {cell(r.get('settle_s'))} | "
+                         f"{cell(r.get('target_err_max_mm'))} | {cell(r.get('fault_after_ms'))} | "
+                         f"{cell(r.get('fault_cause'))} | {cell(r.get('in_fault_until_reset'))} | "
                          f"{len(r.get('acks', []))} | {r.get('status_msgs', 0)} | {r.get('bad_json', 0)} | "
                          f"{r['crc_errors']} |")
         lines += ["", "Mean error in the targets scenario is the ball's tracking error without "
