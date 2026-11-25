@@ -20,7 +20,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-WINDOW_S = 20.0
+WINDOW_S = 30.0  # every demo run (<= 30 s) fits; at the end the whole run is shown
 STATE_COLOURS = {"Run": "#d8f0d8", "Launch": "#d8e4f8", "Fault": "#f8d8d8", "Idle": "#eeeeee"}
 
 
@@ -107,15 +107,23 @@ def run_with_plot(run, args):
     drawn: list = []
 
     def tick(_):
-        _update(samples, lines, ax_h, ax_n, state_text, drawn, WINDOW_S)
         if not th.is_alive():
+            # Finished: show the whole run once and stop redrawing, so the toolbar's
+            # zoom and pan can be used to point at any part of it.
+            _update(samples, lines, ax_h, ax_n, state_text, drawn, None)
             fig.suptitle(f"M3 HIL · scenario {args.scenario} · finished"
                          + (f" · ERROR {out['err']}" if "err" in out else ""))
+            anim.event_source.stop()
+            fig.canvas.draw_idle()
+        else:
+            _update(samples, lines, ax_h, ax_n, state_text, drawn, WINDOW_S)
         return list(lines.values())
 
-    anim = FuncAnimation(fig, tick, interval=100, cache_frame_data=False)  # noqa: F841 (kept alive)
+    anim = FuncAnimation(fig, tick, interval=100, cache_frame_data=False)
     th.start()
     plt.show()  # returns when the window is closed
+    if th.is_alive():  # window closed before the end: stop here, the CSV so far is in reports/
+        raise SystemExit(f"window closed before the end of the run (log so far: reports/hil_{args.scenario}_*.csv)")
     th.join()
     if "err" in out:
         raise out["err"]
