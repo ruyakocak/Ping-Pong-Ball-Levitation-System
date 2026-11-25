@@ -80,8 +80,15 @@ Canlı grafik açılmazsa: senaryoyu `--plot` olmadan çalıştırın, sonra `py
 - **Hedef rampası 250 mm/s** (`target_rate_mm_s`): bir basamak komutu rampaya dönüşür; fırlatmadan sonra rampa
   topun yüksekliğinden başlar. M4 dalgaları (≤ 190 mm/s) etkilenmez.
 - **Bilinen sınırlar:** filtreli yükseklik yokken (yalnız ham, 5 mm gürültü) top tutulur ama salınım 60–90 mm'ye
-  çıkar (R3.6 testi bunu raporlar; şart değil). Fırlatmadan sonra 300 mm hedefte top ~450 mm'ye çıkıp döner
-  (500 mm'de aşım ~20 mm); fırlatma itmesi ±%30 modelde kalkış için gerekli.
+  çıkar (R3.6 testi bunu raporlar; şart değil). Fırlatmadan sonra 300 mm hedefte top ~480 mm'ye çıkıp döner
+  (500 mm'de aşım ~2 mm); fırlatma itmesi ±%30 modelde kalkış için gerekli. Bu yüzden `step` senaryosu
+  500 mm'ye fırlatır, 4. s'de 300 mm'ye iner, basamağı 15. s'de yapar.
+- **İlk gerçek uçuşlar (öneri, dokümanda kural değil):** fırlatma hedefi orta yükseklik, ~500 mm. Aşımda
+  tavana (~960 mm) ve geri düşüşte ızgaraya en çok pay orada; kazançlar ve fırlatma itmesi henüz ders kitabı
+  modeline göre. İlk denemelerde hedefi 400–600 mm'de tutun, E-stop elinizin altında olsun (M1 ile birlikte
+  kontrol edin); gerekirse `n_max_rpm`'i düşürün. Karakterizasyondan (M4) gerçek `hover_rpm` gelince
+  fırlatma rampası (`launch_ramp_rpm_s`) yumuşatılabilir ve düşük yüksekliklerden de temiz kalkılır —
+  bunu düzenek haftasında R3.12 sırasında ayarlayın.
 
 ## Ağ mesajları (UDP 5005, JSON)
 
