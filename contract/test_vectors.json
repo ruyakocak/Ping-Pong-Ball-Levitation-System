@@ -1,0 +1,24 @@
+{
+  "_note": "PROVISIONAL payload layouts. Same vectors are hard-coded in test/test_contract/test_main.c. Replace with M5's frozen vectors when available.",
+  "crc_check": {"ascii": "123456789", "crc": "29b1"},
+  "frames": [
+    {
+      "name": "height",
+      "type": 1, "session": 287454020, "seq": 7,
+      "fields": [512, 505, -120, 3, 1234, 9876543210, 601],
+      "hex": "a55a011544332211070000000002f90188ff03d2040000ea16b04c020000005902aa36"
+    },
+    {
+      "name": "fan_cmd",
+      "type": 16, "session": 3735928559, "seq": 42,
+      "fields": [3150, 2, 1],
+      "hex": "a55a1004efbeadde2a0000004e0c020115f5"
+    },
+    {
+      "name": "fan_state",
+      "type": 18, "session": 16909060, "seq": 99,
+      "fields": [3001, 512, 0, 1, 0, 41],
+      "hex": "a55a120c0403020163000000b90b000200000100290000009541"
+    }
+  ]
+}

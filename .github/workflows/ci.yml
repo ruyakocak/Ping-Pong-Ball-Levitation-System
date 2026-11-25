@@ -1,0 +1,50 @@
+# R3.13: from a fresh clone, on Windows and Linux, one command builds the firmware,
+# runs the native tests and the closed-loop simulation, runs the HIL simulator
+# against the virtual board, and writes the report.
+name: M3 tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: gcc (native tests and virtual board)
+        run: |
+          if ! gcc --version; then
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              choco install mingw -y --no-progress
+              echo "C:/ProgramData/mingw64/mingw64/bin" >> "$GITHUB_PATH"
+            else
+              sudo apt-get update && sudo apt-get install -y gcc
+            fi
+          fi
+      - run: python -m pip install -r requirements.txt
+      - name: One command (tools/run_all.py)
+        run: python tools/run_all.py
+      - name: Report to job summary
+        if: always()
+        run: cat $(ls -t reports/report_*.md | head -1) >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m3-report-${{ matrix.os }}
+          path: reports/

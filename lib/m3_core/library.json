@@ -1,0 +1,7 @@
+{
+  "name": "m3_core",
+  "version": "0.1.0",
+  "description": "Hardware-free M3 control logic (PID, state machine, height gate, target buffer, checks, plant model)",
+  "dependencies": { "contract": "*" },
+  "build": { "libLDFMode": "deep+" }
+}

@@ -1,0 +1,9 @@
+{
+  "height_port": "COM3",
+  "m1_port": "COM4",
+  "game_port": "COM5",
+  "board_ip": "192.168.4.1",
+  "board_udp_port": 5005,
+  "camera_delay_s": 0.030,
+  "plant_params": null
+}
