@@ -95,6 +95,7 @@ m3_ack_t m3_command_apply(m3_ctrl_t *c, const m3_command_t *cmd, uint32_t now)
         if (cmd->mode < 0 || cmd->mode >= MODE_COUNT) return ack(cmd, false, m3_cmd_result_name(CMD_OUT_OF_RANGE));
         if (flying(c)) return ack(cmd, false, m3_cmd_result_name(CMD_WRONG_STATE));
         c->game_mode = cmd->mode == MODE_GAME;
+        c->mode = (uint8_t)cmd->mode;
         return ack(cmd, true, "ok");
     case CMDK_SET: {
         m3_ack_t a = ack(cmd, false, "");

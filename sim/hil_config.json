@@ -4,6 +4,7 @@
   "game_port": "COM5",
   "board_ip": "192.168.4.1",
   "board_udp_port": 5005,
-  "camera_delay_s": 0.030,
-  "plant_params": null
+  "camera_delay_s": 0.03,
+  "plant_params": null,
+  "hil_udp_port": 5010
 }

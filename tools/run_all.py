@@ -5,7 +5,8 @@
 
 Steps: 1. firmware build (esp32, esp32_simball)
        2. native C tests, including the closed-loop simulation (test_ctrl: R3.8, R3.9, R3.11)
-       3. Python tests, including the HIL simulator against the virtual board (R3.13)
+       3. Python tests: HIL simulator against the virtual board, over the same serial
+          frames and UDP JSON as the real board (R3.7, R3.10, R3.13)
 
 Same on Windows and Linux. Test names carry the requirement ID
 (test_R3_5b_... -> R3.5), so the report lists every M3 requirement with its
@@ -104,12 +105,20 @@ def main() -> int:
     hil = REPORTS / f"hil_virtual_{osname}.json"
     if hil.exists():
         lines += ["", "## HIL simulator, virtual board", "",
-                  "| Scenario | Board state | Mean error mm | Peak-to-peak mm | Off after camera loss ms | CRC errors |",
-                  "|---|---|---|---|---|---|"]
+                  "| Scenario | Board state | Mean error mm | Peak-to-peak mm | Target vs sent max mm "
+                  "| Off after camera loss ms | Acks | Status msgs | Bad JSON | CRC errors |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
+
+        def cell(v):
+            return "-" if v is None else v
+
         for name, r in json.loads(hil.read_text(encoding="utf-8")).items():
-            lines.append(f"| {name} | {r['final_state']} | {r['mean_err_mm'] if r['mean_err_mm'] is not None else '-'} | "
-                         f"{r['p2p_mm'] if r['p2p_mm'] is not None else '-'} | "
-                         f"{r['off_after_loss_ms'] if r['off_after_loss_ms'] is not None else '-'} | {r['crc_errors']} |")
+            lines.append(f"| {name} | {r['final_state']} | {cell(r['mean_err_mm'])} | {cell(r['p2p_mm'])} | "
+                         f"{cell(r.get('target_err_max_mm'))} | {cell(r['off_after_loss_ms'])} | "
+                         f"{len(r.get('acks', []))} | {r.get('status_msgs', 0)} | {r.get('bad_json', 0)} | "
+                         f"{r['crc_errors']} |")
+        lines += ["", "Mean error in the targets scenario is the ball's tracking error without "
+                  "feed-forward (M4's job, R4.7); T3.7 is the target column."]
 
     lines += ["", "## All test cases", "", "| Suite | Test | Result | Message |", "|---|---|---|---|"]
     for suite, name, ok, msg in results:

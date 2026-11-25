@@ -45,6 +45,8 @@ typedef struct {
     m3_fsm_t fsm;
     m3_tbuf_t tbuf;
     bool game_mode;         /* set only through the mode command */
+    uint8_t mode;           /* m3_mode_t (hold / wave / game), for status */
+    float target_mm;        /* target used at the last control step, for status */
     m3_stuck_t stuck;       /* stuck-ball warning: status only, never a fault */
 
     /* game board link (Serial1) */

@@ -12,3 +12,6 @@ reports/
 .vscode/
 __pycache__/
 .pytest_cache/
+
+# Wi-Fi password for the board (see include/m3_config.h)
+include/wifi_secrets.h

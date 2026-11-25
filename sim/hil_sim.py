@@ -1,34 +1,37 @@
-"""Hardware-in-the-loop simulator: plays M1 and M2 (later M4) for the control board.
+"""Hardware-in-the-loop simulator: plays M1, M2, M4 and the M5 operator for the control board.
 
-    python sim/hil_sim.py --scenario hold                       # real board on serial ports
+    python sim/hil_sim.py --scenario hold                      # real board: serial ports + UDP
     python sim/hil_sim.py --scenario hold --virtual ./vboard   # no board (CI, R3.13)
 
-Real board wiring (two serial ports on the computer, names in sim/hil_config.json):
+Real board wiring (names and addresses in sim/hil_config.json):
     height_port : the control board's USB (it reads height here)
     m1_port     : USB-UART adapter on the board's Serial2 (GPIO16/17): fan_cmd in, fan_state out
+    board_ip    : the board on the rig Wi-Fi; commands and target_points go to board_ip:5005,
+                  acks and status come back to this computer on hil_udp_port (5010, as the gateway)
 
---virtual runs tools/vboard.c instead: the same m3_core + contract code as the
+--virtual runs tools/vboard.c instead: the same m3_core + contract + net code as the
 firmware, fed through stdin/stdout in lock-step with a simulated 1 ms clock.
-Everything on this side (plant, M1, camera, framing, metrics) is identical in
-both modes; only the link and the clock differ.
+Everything on this side (plant, M1, camera, operator, M4, framing, metrics) is
+identical in both modes; only the links and the clock differ.
 
-The simulator knows the true ball height, so error and oscillation are measured
-exactly. Each run writes a CSV log and prints a JSON summary.
+Every run starts the board the normal way: Reset, then Start (retried until the ack
+says ok), as JSON commands. The simulator knows the true ball height, so error and
+oscillation are measured exactly. Each run writes a CSV log and prints a JSON summary.
 
 Scenarios:
-    hold         launch and hold the board's target; mean error and peak-to-peak
-                 of the true height after --settle seconds
-    camera_loss  hold, then M2 stops sending at --loss-at; time until the board
-                 switches the blower off (R3.5: within 200 ms)
-
-STATUS: virtual board complete. Real board: Start/Reset need the UDP command path
-(net task, port 5005), not written yet; until then send them by hand.
+    hold         hold the board's target; mean error and peak-to-peak after --settle
+    camera_loss  hold, then M2 stops at --loss-at; time until the blower is off (R3.5)
+    targets      M4 sends a wave as target_points (30 Hz, 200 ms ahead, own clock,
+                 random network delay up to --max-delay); tracking error after --settle (R3.7)
+    commands     hold, then live changes: a valid gain, a safety limit, an out-of-range
+                 value and a mode change while flying; the acks are checked (R3.10)
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
 import platform
 import random
 import struct
@@ -44,7 +47,6 @@ from m3sim import contract as ct  # noqa: E402
 from m3sim.plant import Plant, PlantParams  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-EV_START, EV_STOP, EV_RESET = 0, 1, 2  # m3_event_t
 STATE_NAMES = {0: "Idle", 1: "Launch", 2: "Run", 3: "Fault"}
 
 
@@ -146,8 +148,8 @@ class VirtualBoard:
     def _rec(kind: int, now_ms: int, data: bytes) -> bytes:
         return struct.pack("<BIH", kind, now_ms, len(data)) + data
 
-    def exchange(self, now_ms: int, usb: bytes, m1: bytes, commands: list[int]) -> bytes:
-        out = b"".join(self._rec(2, now_ms, bytes([c])) for c in commands)
+    def exchange(self, now_ms: int, usb: bytes, m1: bytes, datagrams: list[bytes]) -> tuple[bytes, list[bytes]]:
+        out = b"".join(self._rec(2, now_ms, d) for d in datagrams)
         if usb:
             out += self._rec(0, now_ms, usb)
         if m1:
@@ -155,9 +157,11 @@ class VirtualBoard:
         self.p.stdin.write(out + self._rec(3, now_ms, b""))
         self.p.stdin.flush()
         (n,) = struct.unpack("<H", self._read(2))
-        data = self._read(n)
+        serial_out = self._read(n)
         self.state, self.stuck = self._read(2)
-        return data
+        (n,) = struct.unpack("<H", self._read(2))
+        udp_out = [d for d in self._read(n).split(b"\n") if d]
+        return serial_out, udp_out
 
     def _read(self, n: int) -> bytes:
         buf = b""
@@ -171,6 +175,128 @@ class VirtualBoard:
     def close(self) -> None:
         self.p.stdin.close()
         self.p.wait(timeout=5)
+
+
+class UdpLink:
+    """Real board: commands and target_points to board_ip:5005; acks and status come back here."""
+
+    def __init__(self, board_ip: str, board_port: int, local_port: int) -> None:
+        import socket
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", local_port))
+        self.sock.setblocking(False)
+        self.board = (board_ip, board_port)
+
+    def exchange(self, datagrams: list[bytes]) -> list[bytes]:
+        for d in datagrams:
+            self.sock.sendto(d, self.board)
+        got = []
+        while True:
+            try:
+                got.append(self.sock.recv(2048))
+            except (BlockingIOError, OSError):
+                return got
+
+
+class Operator:
+    """Stands in for M5: Reset, then Start (retried until accepted); reads acks and status."""
+
+    RETRY_S = 0.3
+
+    def __init__(self, rng: random.Random) -> None:
+        self.session = rng.getrandbits(32)
+        self.next_id = 1
+        self.sent: dict[int, str] = {}
+        self.acks: list[dict] = []
+        self.status: dict | None = None
+        self.n_status = 0
+        self.bad_json = 0
+        self.started_at: float | None = None
+        self._next_try = 0.05
+        self._reset_ok = False
+        self._extra: list[tuple[float, dict]] = []
+        self.status_log: list[tuple[float, dict]] = []  # (receive time, status)
+
+    def command(self, now: float, cmd: str, **fields) -> bytes:
+        rid = self.next_id
+        self.next_id += 1
+        self.sent[rid] = cmd
+        msg = {"type": "command", "src": "m5", "session": self.session, "t": int(now * 1000),
+               "request_id": rid, "cmd": cmd, **fields}
+        return json.dumps(msg).encode()
+
+    def schedule(self, at: float, cmd: str, **fields) -> None:
+        self._extra.append((at, {"cmd": cmd, **fields}))
+
+    def step(self, now: float) -> list[bytes]:
+        out = []
+        if self.started_at is None and now >= self._next_try:
+            self._next_try = now + self.RETRY_S
+            out.append(self.command(now, "start" if self._reset_ok else "reset"))
+        due = [e for e in self._extra if e[0] <= now]
+        for e in due:
+            self._extra.remove(e)
+            out.append(self.command(now, **e[1]))
+        return out
+
+    def receive(self, now: float, datagrams: list[bytes]) -> None:
+        for d in datagrams:
+            try:
+                m = json.loads(d)
+            except ValueError:
+                self.bad_json += 1
+                continue
+            if m.get("type") == "status":
+                self.status = m
+                self.status_log.append((now, m))
+                self.n_status += 1
+            elif m.get("type") == "ack":
+                m["rx_s"] = round(now, 3)
+                self.acks.append(m)
+                cmd = self.sent.get(m.get("request_id"))
+                if cmd == "reset" and m.get("ok"):
+                    self._reset_ok = True
+                if cmd == "start" and m.get("ok") and self.started_at is None:
+                    self.started_at = now
+
+
+class TargetSender:
+    """Stands in for M4: target_points at 30 Hz, 200 ms ahead, its own clock, random network delay."""
+
+    def __init__(self, rng: random.Random, start_s: float, center: float, amp: float, freq: float,
+                 max_delay_s: float) -> None:
+        self.rng = rng
+        self.session = rng.getrandbits(32)
+        self.clock_offset_ms = 1_000_000 + rng.randrange(100_000)  # sender clock != board clock
+        self.start_s, self.center, self.amp, self.freq = start_s, center, amp, freq
+        self.max_delay_s = max_delay_s
+        self.next_send = start_s
+        self.in_flight: list[tuple[float, bytes]] = []
+        self.sent = 0
+
+    def target(self, t_s: float) -> float:
+        if t_s < self.start_s:
+            return self.center
+        return self.center + self.amp * math.sin(2 * math.pi * self.freq * (t_s - self.start_s))
+
+    def step(self, now: float) -> list[bytes]:
+        if now >= self.next_send:
+            self.next_send += 1 / 30
+            pts = []
+            for k in range(7):  # now .. now + 200 ms
+                ts = now + k * 0.0333
+                pts.append({"t": int(ts * 1000) + self.clock_offset_ms, "h": round(self.target(ts), 1),
+                            "ff": 0, "top": 0})
+            msg = {"type": "target_points", "src": "m4", "session": self.session,
+                   "t": int(now * 1000) + self.clock_offset_ms, "points": pts}
+            self.in_flight.append((now + self.rng.uniform(0, self.max_delay_s), json.dumps(msg).encode()))
+            self.sent += 1
+        due = [p for p in self.in_flight if p[0] <= now]
+        for p in due:
+            self.in_flight.remove(p)
+        return [p[1] for p in sorted(due)]
 
 
 @dataclass
@@ -187,6 +313,14 @@ class Result:
     fan_cmds: int = 0
     crc_errors: int = 0
     off_after_loss_ms: float | None = None
+    started_at_s: float | None = None
+    acks: list[dict] = field(default_factory=list)
+    status_msgs: int = 0
+    bad_json: int = 0
+    last_status: dict | None = None
+    targets_sent: int = 0
+    target_err_mean_mm: float | None = None  # targets: board's target vs sent trajectory (T3.7)
+    target_err_max_mm: float | None = None
     log: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -197,13 +331,22 @@ def run(args: argparse.Namespace) -> Result:
     rig = Rig(params, args.noise_mm, args.drop, cfg.get("camera_delay_s", 0.030), args.seed)
     mode = "virtual" if args.virtual else "serial"
     res = Result(args.scenario, mode, platform.system(), args.duration, args.target)
+    op = Operator(rig.rng)
+    m4 = None
+    if args.scenario == "targets":
+        m4 = TargetSender(rig.rng, args.settle - 5.0, args.target, args.amp, args.freq, args.max_delay)
+    if args.scenario == "commands":
+        op.schedule(args.settle, "set", param="kp", value=1.2)
+        op.schedule(args.settle + 0.5, "set", param="abs_max_rpm", value=7000)   # safety limit: refused
+        op.schedule(args.settle + 1.0, "set", param="kp", value=999)             # out of range: refused
+        op.schedule(args.settle + 1.5, "mode", mode="game")                      # flying: refused
 
     out_dir = HERE.parent / "reports"
     out_dir.mkdir(exist_ok=True)
     log_path = out_dir / time.strftime(f"hil_{args.scenario}_{mode}_%Y-%m-%d_%H-%M-%S.csv")
     res.log = str(log_path)
 
-    board = h_port = m1_port = None
+    board = udp = h_port = m1_port = None
     if args.virtual:
         board = VirtualBoard(Path(args.virtual), args.target)
     else:
@@ -211,7 +354,7 @@ def run(args: argparse.Namespace) -> Result:
 
         h_port = serial.Serial(cfg["height_port"], 115200, timeout=0)
         m1_port = serial.Serial(cfg["m1_port"], 115200, timeout=0)
-        res.notes.append("real board: send Reset and Start by hand (UDP command path not written yet)")
+        udp = UdpLink(cfg["board_ip"], cfg.get("board_udp_port", 5005), cfg.get("hil_udp_port", 5010))
 
     errs: list[float] = []
     lo, hi = float("inf"), float("-inf")
@@ -223,7 +366,7 @@ def run(args: argparse.Namespace) -> Result:
     step_ms = 0
     with log_path.open("w", newline="", encoding="utf-8") as fh:
         log = csv.writer(fh)
-        log.writerow(["t_s", "true_h_mm", "rpm", "rpm_cmd", "m1_state", "board_state"])
+        log.writerow(["t_s", "true_h_mm", "target_mm", "rpm", "rpm_cmd", "m1_state", "board_state"])
         while now < args.duration:
             if board:
                 step_ms += 1
@@ -234,49 +377,73 @@ def run(args: argparse.Namespace) -> Result:
             if loss_at is not None and now >= loss_at:
                 rig.camera_on = False
             usb, m1 = rig.step(now, dt, from_board)
+            datagrams = op.step(now) + (m4.step(now) if m4 else [])
 
             if board:
-                cmds = [EV_RESET] if step_ms == 50 else [EV_START] if step_ms == 100 else []
-                from_board = board.exchange(step_ms, usb, m1, cmds)
+                from_board, replies = board.exchange(step_ms, usb, m1, datagrams)
             else:
                 if usb:
                     h_port.write(usb)
                 if m1:
                     m1_port.write(m1)
                 from_board = m1_port.read(4096)
+                replies = udp.exchange(datagrams)
                 time.sleep(0.0005)
+            op.receive(now, replies)
 
+            target = m4.target(now) if m4 else args.target
             if loss_at is not None and off_at is None and now >= loss_at and rig.m1.rpm_cmd == 0.0:
                 off_at = now
             if loss_at is None and now >= args.settle:
-                err = rig.plant.h_mm - args.target
-                errs.append(abs(err))
+                errs.append(abs(rig.plant.h_mm - target))
                 lo, hi = min(lo, rig.plant.h_mm), max(hi, rig.plant.h_mm)
             if step_ms % 10 == 0 or not board:
-                log.writerow([f"{now:.3f}", f"{rig.plant.h_mm:.1f}", f"{rig.plant.rpm:.0f}",
-                              f"{rig.m1.rpm_cmd:.0f}", rig.m1.state, board.state if board else ""])
+                st = op.status["state"] if op.status else ""
+                log.writerow([f"{now:.3f}", f"{rig.plant.h_mm:.1f}", f"{target:.1f}", f"{rig.plant.rpm:.0f}",
+                              f"{rig.m1.rpm_cmd:.0f}", rig.m1.state, st])
 
     if board:
         res.final_state = STATE_NAMES.get(board.state, str(board.state))
         board.close()
+    elif op.status:
+        res.final_state = op.status.get("state", "").capitalize()
     if errs:
         res.mean_err_mm = round(sum(errs) / len(errs), 2)
         res.p2p_mm = round(hi - lo, 2)
     if loss_at is not None and off_at is not None:
         res.off_after_loss_ms = round((off_at - loss_at) * 1000.0, 1)
     res.m1_state, res.fan_cmds, res.crc_errors = rig.m1.state, rig.m1.cmds, rig.dec.crc_errors
+    res.started_at_s = op.started_at
+    res.acks = [{k: a.get(k) for k in ("request_id", "cmd", "param", "ok", "pending", "applied", "reason", "rx_s")
+                 if k in a} for a in op.acks]
+    res.status_msgs, res.bad_json, res.last_status = op.n_status, op.bad_json, op.status
+    res.targets_sent = m4.sent if m4 else 0
+    if m4:
+        # The board's own clock in status.t equals the simulated clock with the virtual
+        # board; with a real board the receive time is used (Wi-Fi delay, a few ms).
+        errs_t = []
+        for rx, st in op.status_log:
+            t_board = st["t"] / 1000.0 if board else rx
+            if t_board >= args.settle and st.get("target_mm") is not None:
+                errs_t.append(abs(st["target_mm"] - m4.target(t_board)))
+        if errs_t:
+            res.target_err_mean_mm = round(sum(errs_t) / len(errs_t), 2)
+            res.target_err_max_mm = round(max(errs_t), 2)
     return res
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", type=Path, default=HERE / "hil_config.json")
-    ap.add_argument("--scenario", choices=["hold", "camera_loss"], default="hold")
+    ap.add_argument("--scenario", choices=["hold", "camera_loss", "targets", "commands"], default="hold")
     ap.add_argument("--virtual", type=Path, help="path to the vboard program; omit for a real board")
     ap.add_argument("--duration", type=float, default=30.0)
-    ap.add_argument("--settle", type=float, default=15.0, help="hold: seconds before measuring")
+    ap.add_argument("--settle", type=float, default=15.0, help="seconds before measuring")
     ap.add_argument("--loss-at", type=float, default=10.0, help="camera_loss: when M2 goes silent")
-    ap.add_argument("--target", type=float, default=500.0, help="virtual board hold target, mm")
+    ap.add_argument("--target", type=float, default=500.0, help="hold target / wave centre, mm")
+    ap.add_argument("--amp", type=float, default=100.0, help="targets: wave amplitude, mm")
+    ap.add_argument("--freq", type=float, default=0.2, help="targets: wave frequency, Hz")
+    ap.add_argument("--max-delay", type=float, default=0.150, help="targets: random network delay up to, s")
     ap.add_argument("--noise-mm", type=float, default=1.0)
     ap.add_argument("--drop", type=float, default=0.0, help="fraction of dropped frames")
     ap.add_argument("--model-scale", type=float, default=1.0, help="R3.9 robustness factor")

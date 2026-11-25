@@ -88,6 +88,7 @@ bool m3_ctrl_on_height(m3_ctrl_t *c, uint32_t session, const ct_height_t *m, uin
     m3_fsm_out_t o = m3_fsm_output(&c->fsm);
     if (g.src != HG_SRC_NONE && o.enable) {
         m3_target_t t = m3_tbuf_get(&c->tbuf, now);
+        c->target_mm = t.target_mm;
         if (g.src_switched) m3_pid_restart_derivative(&c->pid);
         float n_pid = m3_pid_step(&c->pid, t.target_mm, g.h_mm, g.dt_s, c->cfg.hover_rpm, t.ff_rpm);
         if (o.launch_push) {
