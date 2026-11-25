@@ -119,8 +119,8 @@ def test_R3_11_hil_failure_puts_board_in_fault_and_reset_recovers(vboard, scenar
 def test_R3_8_hil_step_30_to_50_cm(vboard):
     # T3.8: the step as M5 would send it (target_mm command), 1 mm noise.
     r = _run(vboard, "--scenario", "step", "--duration", "30", "--settle", "15", "--seed", "13")
-    step = [a for a in r.acks if a.get("param") == "target_mm"]
-    assert step and step[0]["ok"] and step[0]["applied"] == 500.0
+    moves = [a for a in r.acks if a.get("param") == "target_mm"]  # launch 500 -> 300, then the step
+    assert [m["applied"] for m in moves] == [300.0, 500.0] and all(m["ok"] for m in moves), r.acks
     assert r.final_state == "Run"
     assert r.overshoot_mm < 50.0, r      # overshoot below 5 cm
     assert r.settle_s <= 4.0, r          # settled within 4 s

@@ -20,7 +20,11 @@ oscillation are measured exactly. Each run writes a CSV log and prints a JSON su
 
 Scenarios:
     hold         hold the board's target; mean error and peak-to-peak after --settle
-    camera_loss  hold, then M2 stops at --loss-at; time until the blower is off (R3.5)
+    step         launch to --target, move to --step-from at --move-at, then the measured
+                 step to --step-to at --settle: overshoot, settling time, then error (T3.8)
+    camera_loss, bridged_only, m1_fault, estop, fan_state_lost
+                 hold, then the failure at --fault-at; cleared 1 s later, Reset/Start 1 s
+                 after that: time to Fault, cause, Fault kept until Reset (R3.5, R3.6, R3.11)
     targets      M4 sends a wave as target_points (30 Hz, 200 ms ahead, own clock,
                  random network delay up to --max-delay); tracking error after --settle (R3.7)
     commands     hold, then live changes: a valid gain, a safety limit, an out-of-range
@@ -409,7 +413,9 @@ def run(args: argparse.Namespace, on_sample=None) -> Result:
     rig = Rig(params, args.noise_mm, args.drop, cfg.get("camera_delay_s", 0.030), args.seed)
     mode = "virtual" if args.virtual else "serial"
     sc = args.scenario
-    hold_mm = args.step_from if sc == "step" else args.target
+    # step: launch to --target (500 mm, the cleanest launch), move to --step-from at --move-at,
+    # then the measured step --step-from -> --step-to at --settle.
+    hold_mm = args.target
     res = Result(sc, mode, platform.system(), args.duration, args.step_to if sc == "step" else args.target)
     op = Operator(rig.rng)
     m4 = None
@@ -422,6 +428,7 @@ def run(args: argparse.Namespace, on_sample=None) -> Result:
         op.schedule(args.settle + 1.5, "mode", mode="game")                      # flying: refused
     step_at = args.settle if sc == "step" else None
     if step_at is not None:
+        op.schedule(args.move_at, "set", param="target_mm", value=args.step_from)
         op.schedule(step_at, "set", param="target_mm", value=args.step_to)
     fault_at = args.fault_at if sc in FAULT_SCENARIOS else None
     clear_at = fault_at + 1.0 if fault_at is not None else None
@@ -509,7 +516,7 @@ def run(args: argparse.Namespace, on_sample=None) -> Result:
             op.receive(now, replies)
 
             if step_at is not None:
-                ref = args.step_to if now >= step_at else hold_mm
+                ref = args.step_to if now >= step_at else args.step_from if now >= args.move_at else hold_mm
             else:
                 ref = m4.target(now) if m4 else args.target
             h = rig.plant.h_mm
@@ -592,6 +599,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--target", type=float, default=500.0, help="hold target / wave centre, mm")
     ap.add_argument("--step-from", type=float, default=300.0, help="step: first height, mm")
     ap.add_argument("--step-to", type=float, default=500.0, help="step: second height, mm")
+    ap.add_argument("--move-at", type=float, default=4.0, help="step: when the ball moves from --target to --step-from, s")
     ap.add_argument("--amp", type=float, default=100.0, help="targets: wave amplitude, mm")
     ap.add_argument("--freq", type=float, default=0.2, help="targets: wave frequency, Hz")
     ap.add_argument("--max-delay", type=float, default=0.150, help="targets: random network delay up to, s")
